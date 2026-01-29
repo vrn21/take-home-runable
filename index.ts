@@ -1257,6 +1257,13 @@ export async function runAgent(
   console.log(`[Agent] Starting with ${messages.length} messages`);
 
   // NOTE: System prompt is messages[0], do NOT pass separate 'system' parameter
+  
+  // DEBUG: Check for duplicates or existing IDs
+  // console.log("DEBUG: Messages sent to LLM:", messages.map(m => ({ role: m.role, id: (m as any).id, contentSnippet: typeof m.content === 'string' ? m.content.slice(0, 20) : 'complex' })));
+
+  // Track which messages from the current generation have already been persisted
+  let persistedCount = 0;
+
   const result = await generateText({
     model,
     messages,
@@ -1278,8 +1285,46 @@ export async function runAgent(
     },
 
     onStepFinish: async ({ response }) => {
-      // Persist new messages from this step
-      await persistStepMessages(sessionId, response.messages);
+      const pc = await import("picocolors");
+      
+      // Determine which messages are new in this step
+      const newMessages = response.messages.slice(persistedCount);
+      if (newMessages.length === 0) return;
+      
+      // Log new messages for visibility
+      for (const msg of newMessages) {
+        if (msg.role === 'assistant') {
+          if (typeof msg.content === 'string') {
+            console.log(`\n${pc.default.green(pc.default.bold('[Agent]'))}: ${msg.content}`);
+          } else if (Array.isArray(msg.content)) {
+            for (const part of msg.content) {
+              if (part.type === 'text') {
+                 console.log(`\n${pc.default.green(pc.default.bold('[Agent]'))}: ${part.text}`);
+              } else if (part.type === 'tool-call') {
+                 const args = 'args' in part ? part.args : ('input' in part ? part.input : {});
+                 console.log(`\n${pc.default.cyan(pc.default.bold('[Tool Call]'))}: ${part.toolName}(${JSON.stringify(args)})`);
+              }
+            }
+          }
+        } else if (msg.role === 'tool') {
+           // Tool results are usually inside the content array
+            if (Array.isArray(msg.content)) {
+             for (const part of msg.content) {
+               if (part.type === 'tool-result') {
+                  const p = part as any;
+                  const output = 'output' in p ? p.output : ('result' in p ? p.result : 'done');
+                  let outputStr = JSON.stringify(output);
+                  if (outputStr.length > 200) outputStr = outputStr.slice(0, 200) + '...';
+                  console.log(`${pc.default.dim('[Tool Result]: ' + part.toolName + ' -> ' + outputStr)}`);
+               }
+             }
+           }
+        }
+      }
+
+      // Persist only new messages
+      await persistStepMessages(sessionId, newMessages);
+      persistedCount += newMessages.length;
     },
   });
 
@@ -1317,18 +1362,20 @@ export async function runAgentWithErrorHandling(
 }
 
 // =============================================================================
-// SECTION 9: SESSION LIFECYCLE
+// SECTION 9: SESSION LIFECYCLE (INTERACTIVE)
 // =============================================================================
 
 // Module-level variable for graceful shutdown container tracking
 let currentContainerId: string | null = null;
 
 /**
- * Run a complete session: create session, start container, run agent, cleanup.
+ * Run an interactive session: creates resources once, then loops on user input.
  */
-export async function runSession(task: string, model: LanguageModel): Promise<AgentResult> {
+export async function runInteractiveSession(initialTask: string, model: LanguageModel): Promise<void> {
+  const pc = await import("picocolors");
+
   // 1. Create session
-  const session = await createSession(task);
+  const session = await createSession(initialTask);
   console.log(`[Session] Created: ${session.id}`);
 
   let containerId: string | null = null;
@@ -1339,19 +1386,37 @@ export async function runSession(task: string, model: LanguageModel): Promise<Ag
     currentContainerId = containerId; // Track for graceful shutdown
     console.log(`[Session] Container started: ${containerId}`);
 
-    // 3. Run agent loop with compaction
-    const result = await runAgentWithErrorHandling(
-      session.id,
-      task,
-      containerId,
-      model
-    );
+    // Track active task
+    let currentTask = initialTask;
+
+    // 3. Enter Interactive Loop
+    while (true) {
+        // Run agent for the current task
+        try {
+            await runAgentWithErrorHandling(session.id, currentTask, containerId, model);
+        } catch (e) {
+            console.error(pc.default.red(`\n[Error] Agent failed: ${e}`));
+            // Don't crash the session, let user try again
+        }
+
+        // Prompt for next input
+        console.log(pc.default.yellow("\n> Enter next task (press Enter twice to submit, or Ctrl+D to exit):"));
+        const nextInput = await readMultilineInput();
+
+        if (!nextInput.trim()) {
+            console.log("Exiting interaction loop.");
+            break;
+        }
+
+        // Append new user message to DB so agent sees it next run
+        await saveMessage(session.id, "user", nextInput, estimateTokens(nextInput));
+        currentTask = nextInput;
+    }
 
     // 4. Update session status to completed
     await updateSessionStatus(session.id, "completed");
     console.log(`[Session] Completed: ${session.id}`);
 
-    return result;
   } catch (error) {
     // Update session status to failed
     await updateSessionStatus(session.id, "failed");
@@ -1475,16 +1540,14 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  console.log("\n[Starting session...]\n");
+  console.log("\n[Starting interactive session...]\n");
 
   try {
     const model = await getModel();
-    const result = await runSession(task, model);
+    await runInteractiveSession(task, model);
 
     console.log("\n================================");
-    console.log("Task completed!");
-    console.log(`Steps executed: ${result.stepsExecuted}`);
-    console.log(`\nFinal response:\n${result.finalMessage}`);
+    console.log("Session finished.");
     process.exit(0);
   } catch (error) {
     console.error("\n================================");
