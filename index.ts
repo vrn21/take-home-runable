@@ -333,52 +333,27 @@ export async function performCompaction(
 // CONVERT DB MESSAGES TO COREMESSAGE
 // =============================================================================
 
+const CONTENT_JSON_PREFIX = "__content_json__:";
+
 export function dbMessageToCoreMessage(msg: Message): ModelMessage {
-  if (msg.role === "tool") {
-    // Tool messages require content as Array<ToolResultPart> in AI SDK v6
-    const parsed = JSON.parse(msg.content);
-    return {
-      role: "tool",
-      content: [
-        {
-          type: "tool-result" as const,
-          toolCallId: parsed.toolCallId,
-          toolName: parsed.toolName || "unknown",
-          output: { type: "text" as const, value: JSON.stringify(parsed.result ?? parsed.content ?? "") },
-        },
-      ],
-    };
+  if (msg.content.startsWith(CONTENT_JSON_PREFIX)) {
+    try {
+      const content = JSON.parse(msg.content.slice(CONTENT_JSON_PREFIX.length));
+      return {
+        role: msg.role as "system" | "user" | "assistant" | "tool",
+        content,
+      };
+    } catch (e) {
+      console.error("Failed to parse JSON content:", e);
+      // Fallback to text if parse fails
+      return {
+        role: msg.role as "system" | "user" | "assistant",
+        content: msg.content,
+      };
+    }
   }
 
-  if (msg.role === "assistant" && msg.content.includes('"toolCalls"')) {
-    // Assistant messages with tool calls need TextPart or ToolCallPart array
-    const parsed = JSON.parse(msg.content);
-    const content: Array<
-      | { type: "text"; text: string }
-      | { type: "tool-call"; toolCallId: string; toolName: string; input: unknown }
-    > = [];
-
-    if (parsed.text) {
-      content.push({ type: "text", text: parsed.text });
-    }
-
-    if (parsed.toolCalls && Array.isArray(parsed.toolCalls)) {
-      for (const call of parsed.toolCalls) {
-        content.push({
-          type: "tool-call",
-          toolCallId: call.id || call.toolCallId,
-          toolName: call.name || call.toolName,
-          input: call.args || call.arguments || call.input || {},
-        });
-      }
-    }
-
-    return {
-      role: "assistant",
-      content: content.length > 0 ? content : "",
-    };
-  }
-
+  // Handle legacy/simple text messages
   return {
     role: msg.role as "system" | "user" | "assistant",
     content: msg.content,
@@ -624,10 +599,12 @@ export interface CompactionSelection {
   messagesToCompact: ModelMessage[];
   messagesToKeep: ModelMessage[];
   previousSummary: string | null;
+  boundaryIndex: number; // Index in the original message array where keeping begins
 }
 
 export interface CompactionResult {
   compactedMessages: ModelMessage[];
+  boundaryIndex: number;
   compactionEvent: {
     round: number;
     tokensBefore: number;
@@ -660,11 +637,18 @@ export function estimateMessagesTokens(messages: ModelMessage[]): number {
           total += estimateTokens(part.text);
         } else if ('toolName' in part) {
           total += estimateTokens(part.toolName);
-          if ('input' in part) {
+          // Check for V6 args (or legacy input)
+          if ('args' in part) {
+            total += estimateTokens(JSON.stringify(part.args));
+          } else if ('input' in part) {
             total += estimateTokens(JSON.stringify(part.input));
           }
+          
+          // Check for V6 output (or legacy result)
           if ('output' in part) {
             total += estimateTokens(JSON.stringify(part.output));
+          } else if ('result' in part) {
+            total += estimateTokens(JSON.stringify(part.result));
           }
         }
       }
@@ -728,6 +712,7 @@ export function selectMessagesToCompact(
       messagesToCompact: [],
       messagesToKeep: messages,
       previousSummary: null,
+      boundaryIndex: 0,
     };
   }
 
@@ -763,6 +748,7 @@ export function selectMessagesToCompact(
       messagesToCompact: [],
       messagesToKeep: messages,
       previousSummary,
+      boundaryIndex: 0, // Nothing compacted implies boundary is at start (effectively)
     };
   }
 
@@ -774,6 +760,7 @@ export function selectMessagesToCompact(
       ...messages.slice(boundaryIndex),
     ],
     previousSummary,
+    boundaryIndex,
   };
 }
 
@@ -794,12 +781,22 @@ export function formatMessagesForSummary(messages: ModelMessage[]): string {
     } else if (Array.isArray(msg.content)) {
       content = msg.content.map(part => {
         if ('text' in part) return part.text;
-        if ('toolName' in part && 'input' in part) {
-          return `[Tool: ${part.toolName}(${JSON.stringify(part.input)})]`;
+        
+        // Handle tool calls (V6 args or legacy input)
+        if ('toolName' in part) {
+            const args = 'args' in part ? part.args : ('input' in part ? part.input : {});
+            if (!('output' in part) && !('result' in part)) {
+                 return `[Tool: ${part.toolName}(${JSON.stringify(args)})]`;
+            }
         }
-        if ('toolName' in part && 'output' in part) {
-          const output = JSON.stringify(part.output);
-          return `[Result: ${output.slice(0, 500)}${output.length > 500 ? '...' : ''}]`;
+
+        // Handle tool results (V6 output or legacy result)
+        if ('toolName' in part) {
+           const outputVal = 'output' in part ? part.output : ('result' in part ? part.result : null);
+           if (outputVal !== null) {
+              const outputStr = JSON.stringify(outputVal);
+              return `[Result: ${outputStr.slice(0, 500)}${outputStr.length > 500 ? '...' : ''}]`;
+           }
         }
         return '';
       }).join('\n');
@@ -925,6 +922,7 @@ export async function compact(
   if (selection.messagesToCompact.length === 0) {
     return {
       compactedMessages: messages,
+      boundaryIndex: 0,
       compactionEvent: {
         round: 0,
         tokensBefore,
@@ -972,6 +970,7 @@ export async function compact(
 
   return {
     compactedMessages,
+    boundaryIndex: selection.boundaryIndex,
     compactionEvent: {
       round,
       tokensBefore,
@@ -1000,8 +999,14 @@ export async function safeCompact(
 
     // Get the boundary sequence for marking messages
     const activeMessages = await getActiveMessages(sessionId);
-    const keepCount = (config?.recentMessagesToKeep ?? DEFAULT_COMPACTION_CONFIG.recentMessagesToKeep);
-    const boundarySequence = activeMessages.length - keepCount + 1;
+    
+    // Safety check: ensure we have a valid boundary index
+    if (result.boundaryIndex === undefined || result.boundaryIndex >= activeMessages.length) {
+        throw new Error(`Invalid boundary index ${result.boundaryIndex} for ${activeMessages.length} messages`);
+    }
+
+    // Map the array index key from selection logic to the actual DB sequence number
+    const boundarySequence = activeMessages[result.boundaryIndex].sequence;
 
     // Persist compaction event and mark messages atomically
     await performCompaction(
@@ -1213,35 +1218,9 @@ export function serializeMessageContent(msg: ModelMessage): string {
   if (typeof msg.content === "string") {
     return msg.content;
   }
-
-  // Handle array content (tool calls, mixed content)
-  if (Array.isArray(msg.content)) {
-    const parts: Array<{ type: string; [key: string]: unknown }> = [];
-
-    for (const part of msg.content) {
-      if ("text" in part && typeof part.text === "string") {
-        parts.push({ type: "text", text: part.text });
-      } else if ("toolName" in part) {
-        parts.push({
-          type: "tool-call",
-          toolCallId: "toolCallId" in part ? part.toolCallId : undefined,
-          toolName: part.toolName,
-          input: "input" in part ? part.input : {},
-        });
-      } else if ("result" in part) {
-        parts.push({
-          type: "tool-result",
-          toolCallId: "toolCallId" in part ? part.toolCallId : undefined,
-          result: part.result,
-        });
-      }
-    }
-
-    return JSON.stringify(parts);
-  }
-
-  // Fallback for any other content type
-  return JSON.stringify(msg.content);
+  
+  // Use prefix for complex content to ensure safe round-tripping
+  return CONTENT_JSON_PREFIX + JSON.stringify(msg.content);
 }
 
 /**

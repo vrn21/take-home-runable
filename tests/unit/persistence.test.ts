@@ -269,16 +269,23 @@ describe("Persistence Layer Unit Tests", () => {
     });
 
     test("dbMessageToCoreMessage should parse tool message JSON for AI SDK v6", () => {
+      // Mock content stored in DB with prefix
+      const toolContent = [
+        {
+          type: "tool-result",
+          toolCallId: "call-123",
+          toolName: "readFile",
+          output: { data: "file contents" } // V6 uses output, not result
+        }
+      ];
+      
       const dbMsg: Message = {
         id: "4",
         sessionId: "session-1",
         sequence: 3,
         role: "tool",
-        content: JSON.stringify({
-          toolCallId: "call-123",
-          toolName: "readFile",
-          result: { data: "file contents" },
-        }),
+        // Simulate serialized content with prefix
+        content: "__content_json__:" + JSON.stringify(toolContent),
         tokenCount: 20,
         isCompacted: 0,
         createdAt: Date.now(),
@@ -287,24 +294,33 @@ describe("Persistence Layer Unit Tests", () => {
       const coreMsg = dbMessageToCoreMessage(dbMsg);
 
       expect(coreMsg.role).toBe("tool");
-      // AI SDK v6 ToolModelMessage has content as Array<ToolResultPart>
       expect(Array.isArray(coreMsg.content)).toBe(true);
-      const toolContent = coreMsg.content as Array<{ type: string; toolCallId: string; toolName: string }>;
-      expect(toolContent[0].type).toBe("tool-result");
-      expect(toolContent[0].toolCallId).toBe("call-123");
-      expect(toolContent[0].toolName).toBe("readFile");
+      const content = coreMsg.content as Array<any>;
+      expect(content[0].type).toBe("tool-result");
+      expect(content[0].toolCallId).toBe("call-123");
+      expect(content[0].toolName).toBe("readFile");
+      expect(content[0].output).toEqual({ data: "file contents" });
     });
 
     test("dbMessageToCoreMessage should parse assistant with toolCalls for AI SDK v6", () => {
+      // Mock content stored in DB with prefix
+      const assistantContent = [
+        { type: "text", text: "Let me help you" },
+        { 
+          type: "tool-call",
+          toolCallId: "call-1",
+          toolName: "readFile",
+          args: { path: "/test" } // V6 uses args, not input
+        }
+      ];
+
       const dbMsg: Message = {
         id: "5",
         sessionId: "session-1",
         sequence: 2,
         role: "assistant",
-        content: JSON.stringify({
-          text: "Let me help you",
-          toolCalls: [{ id: "call-1", name: "readFile", args: { path: "/test" } }],
-        }),
+        // Simulate serialized content with prefix
+        content: "__content_json__:" + JSON.stringify(assistantContent),
         tokenCount: 25,
         isCompacted: 0,
         createdAt: Date.now(),
@@ -313,15 +329,16 @@ describe("Persistence Layer Unit Tests", () => {
       const coreMsg = dbMessageToCoreMessage(dbMsg);
 
       expect(coreMsg.role).toBe("assistant");
-      // AI SDK v6 AssistantModelMessage with toolCalls has content as Array<TextPart | ToolCallPart>
       expect(Array.isArray(coreMsg.content)).toBe(true);
-      const content = coreMsg.content as Array<{ type: string; text?: string; toolCallId?: string; toolName?: string; input?: unknown }>;
+      const content = coreMsg.content as Array<any>;
+      
       expect(content[0].type).toBe("text");
       expect(content[0].text).toBe("Let me help you");
+      
       expect(content[1].type).toBe("tool-call");
       expect(content[1].toolCallId).toBe("call-1");
       expect(content[1].toolName).toBe("readFile");
-      expect(content[1].input).toEqual({ path: "/test" });
+      expect(content[1].args).toEqual({ path: "/test" });
     });
   });
 });
