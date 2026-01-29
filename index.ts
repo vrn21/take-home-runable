@@ -590,6 +590,447 @@ export const estimateTokens = (text: string): number => {
 // - When approaching limit, summarize old messages
 
 // =============================================================================
+// SECTION 6.1: COMPACTION CONFIGURATION & TYPES
+// =============================================================================
+
+export interface CompactionConfig {
+  modelContextLimit: number;
+  systemReserve: number;
+  outputReserve: number;
+  safetyBuffer: number;
+  thresholdPercent: number;
+  recentMessagesToKeep: number;
+}
+
+export const DEFAULT_COMPACTION_CONFIG: CompactionConfig = {
+  modelContextLimit: 128_000,  // GPT-4o / GPT-4-turbo
+  systemReserve: 2_000,
+  outputReserve: 4_000,
+  safetyBuffer: 5_000,
+  thresholdPercent: 0.80,
+  recentMessagesToKeep: 10,
+};
+
+export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
+  'gpt-4o': 128_000,
+  'gpt-4-turbo': 128_000,
+  'gpt-4': 8_192,
+  'claude-3-5-sonnet-20240620': 200_000,
+  'claude-3-haiku-20240307': 200_000,
+};
+
+export interface CompactionSelection {
+  messagesToCompact: ModelMessage[];
+  messagesToKeep: ModelMessage[];
+  previousSummary: string | null;
+}
+
+export interface CompactionResult {
+  compactedMessages: ModelMessage[];
+  compactionEvent: {
+    round: number;
+    tokensBefore: number;
+    tokensAfter: number;
+    summaryContent: string;
+  };
+}
+
+// =============================================================================
+// SECTION 6.2: TOKEN ESTIMATION FOR MESSAGE ARRAYS
+// =============================================================================
+
+/**
+ * Estimate total tokens across all messages in the array.
+ * Handles all message types: system, user, assistant, tool.
+ */
+export function estimateMessagesTokens(messages: ModelMessage[]): number {
+  let total = 0;
+
+  for (const message of messages) {
+    // Role contributes ~2 tokens
+    total += 2;
+
+    if (typeof message.content === 'string') {
+      total += estimateTokens(message.content);
+    } else if (Array.isArray(message.content)) {
+      // Handle content parts (text, tool_call, tool_result)
+      for (const part of message.content) {
+        if ('text' in part && typeof part.text === 'string') {
+          total += estimateTokens(part.text);
+        } else if ('toolName' in part) {
+          total += estimateTokens(part.toolName);
+          if ('input' in part) {
+            total += estimateTokens(JSON.stringify(part.input));
+          }
+          if ('output' in part) {
+            total += estimateTokens(JSON.stringify(part.output));
+          }
+        }
+      }
+    }
+  }
+
+  return total;
+}
+
+// =============================================================================
+// SECTION 6.3: COMPACTION THRESHOLD LOGIC
+// =============================================================================
+
+/**
+ * Calculate the token threshold that triggers compaction.
+ */
+export function calculateThreshold(config: CompactionConfig): number {
+  const available = config.modelContextLimit
+    - config.systemReserve
+    - config.outputReserve
+    - config.safetyBuffer;
+  return Math.floor(available * config.thresholdPercent);
+}
+
+/**
+ * Determine if compaction should be triggered.
+ * Called at the start of each agent step via prepareStep.
+ */
+export function shouldCompact(
+  messages: ModelMessage[],
+  config: CompactionConfig = DEFAULT_COMPACTION_CONFIG
+): boolean {
+  // Empty or minimal messages - nothing to compact
+  if (messages.length <= config.recentMessagesToKeep + 1) {
+    return false;
+  }
+
+  const tokenCount = estimateMessagesTokens(messages);
+  const threshold = calculateThreshold(config);
+
+  return tokenCount >= threshold;
+}
+
+// =============================================================================
+// SECTION 6.4: MESSAGE SELECTION ALGORITHM
+// =============================================================================
+
+/**
+ * Select which messages to compact and which to preserve.
+ * 
+ * CRITICAL: Tool calls and their results must stay together.
+ * Orphaned tool messages break the LLM's understanding of state.
+ */
+export function selectMessagesToCompact(
+  messages: ModelMessage[],
+  keepLast: number = 10
+): CompactionSelection {
+  // Nothing to compact if too few messages
+  if (messages.length <= keepLast + 1) {
+    return {
+      messagesToCompact: [],
+      messagesToKeep: messages,
+      previousSummary: null,
+    };
+  }
+
+  // System message is always at index 0 and always kept
+  const systemMessage = messages[0];
+
+  // Calculate initial boundary for recent messages
+  let boundaryIndex = messages.length - keepLast;
+
+  // Adjust boundary to not orphan tool results
+  // Walk backward if we're about to split a tool call/result pair
+  while (boundaryIndex > 1 && messages[boundaryIndex]?.role === 'tool') {
+    boundaryIndex--;
+  }
+
+  // Check if there's a previous summary (index 1, from prior compaction)
+  let previousSummary: string | null = null;
+  let compactionStartIndex = 1;
+
+  // Detect if message[1] is a summary from previous compaction
+  if (
+    messages[1]?.role === 'assistant' &&
+    typeof messages[1].content === 'string' &&
+    messages[1].content.startsWith('## Session Summary')
+  ) {
+    previousSummary = messages[1].content;
+    compactionStartIndex = 2; // Skip the existing summary
+  }
+
+  // If boundary is at or before compaction start, nothing to compact
+  if (boundaryIndex <= compactionStartIndex) {
+    return {
+      messagesToCompact: [],
+      messagesToKeep: messages,
+      previousSummary,
+    };
+  }
+
+  return {
+    messagesToCompact: messages.slice(compactionStartIndex, boundaryIndex),
+    messagesToKeep: [
+      systemMessage,
+      // Summary will be inserted here by compact()
+      ...messages.slice(boundaryIndex),
+    ],
+    previousSummary,
+  };
+}
+
+// =============================================================================
+// SECTION 6.5: SUMMARY GENERATION
+// =============================================================================
+
+/**
+ * Format messages into a readable string for summarization.
+ */
+export function formatMessagesForSummary(messages: ModelMessage[]): string {
+  return messages.map((msg, idx) => {
+    const role = msg.role.toUpperCase();
+    let content = '';
+
+    if (typeof msg.content === 'string') {
+      content = msg.content;
+    } else if (Array.isArray(msg.content)) {
+      content = msg.content.map(part => {
+        if ('text' in part) return part.text;
+        if ('toolName' in part && 'input' in part) {
+          return `[Tool: ${part.toolName}(${JSON.stringify(part.input)})]`;
+        }
+        if ('toolName' in part && 'output' in part) {
+          const output = JSON.stringify(part.output);
+          return `[Result: ${output.slice(0, 500)}${output.length > 500 ? '...' : ''}]`;
+        }
+        return '';
+      }).join('\n');
+    }
+
+    // Truncate very long content
+    if (content.length > 2000) {
+      content = content.slice(0, 2000) + '\n[...truncated...]';
+    }
+
+    return `[${idx}] ${role}:\n${content}`;
+  }).join('\n\n---\n\n');
+}
+
+/**
+ * Extract the original user task from the first user message.
+ */
+export function extractOriginalTask(messages: ModelMessage[]): string {
+  for (const msg of messages) {
+    if (msg.role === 'user' && typeof msg.content === 'string') {
+      return msg.content;
+    }
+  }
+  return 'Unknown task';
+}
+
+/**
+ * Generate a structured summary of compacted messages using LLM.
+ */
+export async function generateSummary(
+  messagesToCompact: ModelMessage[],
+  previousSummary: string | null,
+  originalTask: string,
+  compactionRound: number,
+  model: LanguageModel
+): Promise<string> {
+  const { generateText: genText } = await import('ai');
+  
+  const formattedMessages = formatMessagesForSummary(messagesToCompact);
+
+  const systemPrompt = `You are summarizing a coding agent's conversation history.
+Your summary will replace the compacted messages, so preserve ALL information 
+needed to continue the task successfully.
+
+CRITICAL: Be thorough but concise. Missing information cannot be recovered.`;
+
+  const userPrompt = `## Previous Summary
+${previousSummary ?? 'None - this is the first compaction round.'}
+
+## Original User Task
+${originalTask}
+
+## Messages to Summarize
+${formattedMessages}
+
+## Instructions
+Create a summary with these EXACT sections:
+
+### Session Summary (Compaction Round ${compactionRound})
+
+#### Original Task
+[Preserve the user's original request verbatim]
+
+#### Completed Work
+| File/Component | Action | Description |
+|----------------|--------|-------------|
+[List each file touched with what was done]
+
+#### Key Technical Decisions
+- [Bullet list of choices that affect future work]
+- [Include dependencies installed, patterns used, etc.]
+
+#### Current State
+- Working on: [what's in progress]
+- Last completed: [most recent accomplishment]
+
+#### Pending Work
+- [ ] [Remaining items as checklist]
+
+#### Errors & Resolutions
+[Only include if errors were encountered. Format: error → resolution]
+
+## Constraints
+- Maximum 800 tokens
+- Use tables and bullet points for density
+- Include exact file paths
+- No code blocks unless absolutely critical
+- If previous summary exists, INTEGRATE (don't duplicate) its content`;
+
+  const { text } = await genText({
+    model,
+    system: systemPrompt,
+    prompt: userPrompt,
+    maxOutputTokens: 1000,
+    temperature: 0.3,
+  });
+
+  return text;
+}
+
+// =============================================================================
+// SECTION 6.6: MAIN COMPACTION FUNCTIONS
+// =============================================================================
+
+/**
+ * Perform context compaction on the message array.
+ */
+export async function compact(
+  messages: ModelMessage[],
+  sessionId: string,
+  model: LanguageModel,
+  config: CompactionConfig = DEFAULT_COMPACTION_CONFIG
+): Promise<CompactionResult> {
+  const tokensBefore = estimateMessagesTokens(messages);
+
+  // 1. Select messages to compact vs keep
+  const selection = selectMessagesToCompact(
+    messages,
+    config.recentMessagesToKeep
+  );
+
+  // If nothing to compact, return unchanged
+  if (selection.messagesToCompact.length === 0) {
+    return {
+      compactedMessages: messages,
+      compactionEvent: {
+        round: 0,
+        tokensBefore,
+        tokensAfter: tokensBefore,
+        summaryContent: '',
+      },
+    };
+  }
+
+  // 2. Determine compaction round from database
+  const lastEvent = await getLastCompactionEvent(sessionId);
+  const round = (lastEvent?.round ?? 0) + 1;
+
+  // 3. Extract original task from first user message
+  const originalTask = extractOriginalTask(messages);
+
+  // 4. Generate summary using LLM
+  const summaryContent = await generateSummary(
+    selection.messagesToCompact,
+    selection.previousSummary,
+    originalTask,
+    round,
+    model
+  );
+
+  // 5. Construct new message array with summary
+  const summaryMessage: ModelMessage = {
+    role: 'assistant',
+    content: summaryContent,
+  };
+
+  const compactedMessages: ModelMessage[] = [
+    selection.messagesToKeep[0], // System message
+    summaryMessage,              // New summary
+    ...selection.messagesToKeep.slice(1), // Recent messages
+  ];
+
+  const tokensAfter = estimateMessagesTokens(compactedMessages);
+
+  // 6. Log compaction metrics
+  console.log(
+    `[Compaction] Round ${round}: ${tokensBefore} → ${tokensAfter} tokens ` +
+    `(${selection.messagesToCompact.length} messages summarized)`
+  );
+
+  return {
+    compactedMessages,
+    compactionEvent: {
+      round,
+      tokensBefore,
+      tokensAfter,
+      summaryContent,
+    },
+  };
+}
+
+/**
+ * Safe wrapper for compaction with error handling and persistence.
+ */
+export async function safeCompact(
+  messages: ModelMessage[],
+  sessionId: string,
+  model: LanguageModel,
+  config?: CompactionConfig
+): Promise<ModelMessage[]> {
+  try {
+    const result = await compact(messages, sessionId, model, config);
+
+    // Skip if no compaction happened
+    if (result.compactionEvent.round === 0) {
+      return result.compactedMessages;
+    }
+
+    // Get the boundary sequence for marking messages
+    const activeMessages = await getActiveMessages(sessionId);
+    const keepCount = (config?.recentMessagesToKeep ?? DEFAULT_COMPACTION_CONFIG.recentMessagesToKeep);
+    const boundarySequence = activeMessages.length - keepCount + 1;
+
+    // Persist compaction event and mark messages atomically
+    await performCompaction(
+      sessionId,
+      boundarySequence,
+      {
+        role: 'assistant',
+        content: result.compactionEvent.summaryContent,
+        tokenCount: estimateTokens(result.compactionEvent.summaryContent),
+      },
+      {
+        round: result.compactionEvent.round,
+        tokensBefore: result.compactionEvent.tokensBefore,
+        tokensAfter: result.compactionEvent.tokensAfter,
+      }
+    );
+
+    return result.compactedMessages;
+
+  } catch (error) {
+    // Log but don't fail the agent loop
+    console.error('[Compaction] Failed, continuing without compaction:', error);
+    return messages;
+  }
+}
+
+// Import LanguageModel type for type annotations
+import type { LanguageModel } from 'ai';
+
+// =============================================================================
 // SECTION 7: TOOLS
 // =============================================================================
 
