@@ -5,6 +5,7 @@ import { eq, and, asc, desc, lt } from "drizzle-orm";
 import { tool } from "ai";
 import type { ModelMessage } from "ai";
 import { z } from "zod";
+import { createInterface } from "readline";
 
 // =============================================================================
 // SECTION 3: DATABASE SCHEMA
@@ -1340,6 +1341,9 @@ export async function runAgentWithErrorHandling(
 // SECTION 9: SESSION LIFECYCLE
 // =============================================================================
 
+// Module-level variable for graceful shutdown container tracking
+let currentContainerId: string | null = null;
+
 /**
  * Run a complete session: create session, start container, run agent, cleanup.
  */
@@ -1353,6 +1357,7 @@ export async function runSession(task: string, model: LanguageModel): Promise<Ag
   try {
     // 2. Start Docker container
     containerId = await startContainer(session.id);
+    currentContainerId = containerId; // Track for graceful shutdown
     console.log(`[Session] Container started: ${containerId}`);
 
     // 3. Run agent loop with compaction
@@ -1365,18 +1370,20 @@ export async function runSession(task: string, model: LanguageModel): Promise<Ag
 
     // 4. Update session status to completed
     await updateSessionStatus(session.id, "completed");
-    console.log(`[Session] Completed successfully`);
+    console.log(`[Session] Completed: ${session.id}`);
 
     return result;
   } catch (error) {
     // Update session status to failed
     await updateSessionStatus(session.id, "failed");
-    console.error(`[Session] Failed: ${error}`);
+    console.error(`[Session] Failed: ${session.id}`);
     throw error;
   } finally {
     // 5. Always cleanup container
     if (containerId) {
       await cleanupContainer(containerId);
+      currentContainerId = null;
+      console.log(`[Session] Container cleaned up`);
     }
   }
 }
@@ -1386,63 +1393,128 @@ export async function runSession(task: string, model: LanguageModel): Promise<Ag
 // =============================================================================
 
 /**
- * Read task from stdin and run the agent.
+ * Validate required environment variables before starting.
+ * Ensures API keys are present.
  */
-async function main() {
-  // Read task from stdin
-  console.log("Enter your task (press Ctrl+D when done):");
-  
-  let task = "";
-  const stdin = Bun.stdin.stream();
-  const reader = stdin.getReader();
+export function validateEnvironment(): void {
+  const hasApiKey = process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY;
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      task += new TextDecoder().decode(value);
-    }
-  } finally {
-    reader.releaseLock();
+  if (!hasApiKey) {
+    console.error("Missing required environment variable.");
+    console.error("Set ANTHROPIC_API_KEY or OPENAI_API_KEY in .env or export before running.");
+    process.exit(1);
   }
+}
 
-  task = task.trim();
-  if (!task) {
+/**
+ * Get the configured LLM model based on environment.
+ */
+export async function getModel(): Promise<LanguageModel> {
+  if (process.env.ANTHROPIC_API_KEY) {
+    const { anthropic } = await import("@ai-sdk/anthropic");
+    return anthropic(process.env.MODEL || "claude-3-5-sonnet-20241022");
+  }
+  if (process.env.OPENAI_API_KEY) {
+    const { openai } = await import("@ai-sdk/openai");
+    return openai(process.env.MODEL || "gpt-4o");
+  }
+  throw new Error("No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.");
+}
+
+/**
+ * Setup handlers for graceful shutdown on SIGINT/SIGTERM.
+ * Ensures Docker container is cleaned up before exit.
+ */
+export function setupGracefulShutdown(): void {
+  const cleanup = async (signal: string) => {
+    console.log(`\n[Shutdown] Received ${signal}, cleaning up...`);
+
+    if (currentContainerId) {
+      await cleanupContainer(currentContainerId);
+      console.log("[Shutdown] Container cleaned up");
+    }
+
+    process.exit(0);
+  };
+
+  process.on("SIGINT", () => cleanup("SIGINT"));
+  process.on("SIGTERM", () => cleanup("SIGTERM"));
+}
+
+/**
+ * Read multiline input from stdin.
+ * Submit by pressing Enter twice (empty line ends input).
+ */
+export async function readMultilineInput(): Promise<string> {
+  return new Promise((resolve) => {
+    const lines: string[] = [];
+    const rl = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+
+    rl.on("line", (line) => {
+      // Two consecutive empty lines = submit
+      if (line === "" && lines.length > 0 && lines[lines.length - 1] === "") {
+        rl.close();
+        resolve(lines.slice(0, -1).join("\n"));
+      } else {
+        lines.push(line);
+      }
+    });
+
+    rl.on("close", () => {
+      // If closed without double-enter (e.g., Ctrl+D), return what we have
+      if (lines.length > 0) {
+        resolve(lines.join("\n"));
+      } else {
+        resolve("");
+      }
+    });
+  });
+}
+
+/**
+ * Main entry point: read task and run the agent.
+ */
+async function main(): Promise<void> {
+  console.log("Context-Compacting Coding Agent");
+  console.log("================================\n");
+
+  // Validate environment
+  validateEnvironment();
+
+  // Setup signal handlers for graceful shutdown
+  setupGracefulShutdown();
+
+  console.log("Enter your task (press Enter twice to submit):\n");
+
+  const task = await readMultilineInput();
+
+  if (!task.trim()) {
     console.error("No task provided. Exiting.");
     process.exit(1);
   }
 
-  console.log(`\n[Main] Task received: ${task.slice(0, 100)}${task.length > 100 ? "..." : ""}\n`);
+  console.log("\n[Starting session...]\n");
 
-  // Configure the model - use Anthropic Claude or OpenAI
-  // Import the provider based on environment
-  let model: LanguageModel;
+  try {
+    const model = await getModel();
+    const result = await runSession(task, model);
 
-  if (process.env.ANTHROPIC_API_KEY) {
-    const { anthropic } = await import("@ai-sdk/anthropic");
-    model = anthropic("claude-3-5-sonnet-20241022");
-    console.log("[Main] Using Anthropic Claude 3.5 Sonnet");
-  } else if (process.env.OPENAI_API_KEY) {
-    const { openai } = await import("@ai-sdk/openai");
-    model = openai("gpt-4o");
-    console.log("[Main] Using OpenAI GPT-4o");
-  } else {
-    console.error("Error: No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.");
+    console.log("\n================================");
+    console.log("Task completed!");
+    console.log(`Steps executed: ${result.stepsExecuted}`);
+    console.log(`\nFinal response:\n${result.finalMessage}`);
+    process.exit(0);
+  } catch (error) {
+    console.error("\n================================");
+    console.error("Session failed:", error);
     process.exit(1);
   }
-
-  // Run the session
-  const result = await runSession(task, model);
-
-  console.log("\n========================================");
-  console.log("RESULT");
-  console.log("========================================");
-  console.log(`Success: ${result.success}`);
-  console.log(`Steps executed: ${result.stepsExecuted}`);
-  console.log(`Final message:\n${result.finalMessage}`);
 }
 
-main().catch((error) => {
-  console.error("Fatal error:", error);
-  process.exit(1);
-});
+// Only run main when executed directly (not when imported as a module)
+if (import.meta.main) {
+  main();
+}
