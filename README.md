@@ -1,4 +1,4 @@
-# Context-Compacting Coding Agent
+# Interstice
 
 A coding agent that handles long-running tasks by executing commands in a Docker sandbox and automatically compacting its context window using summarization.
 
