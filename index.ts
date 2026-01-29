@@ -1141,19 +1141,308 @@ export function createTools(containerId: string) {
 }
 
 // =============================================================================
-// TODO: Implement the main agent loop with context compaction
+// SECTION 8: AGENT LOOP
 // =============================================================================
-// Use generateText with prepareStep to handle compaction, or use ToolLoopAgent
 
-const main = async () => {
-  // TODO: Implement
-  // 1. Create or resume a session
-  // 2. Start Docker container
-  // 3. Run agent loop with compaction
-  // 4. Persist messages
-  // 5. Clean up
+import { generateText, stepCountIs } from "ai";
 
-  console.log("Agent not implemented yet");
-};
+// System prompt defining agent behavior
+const SYSTEM_PROMPT = `You are a coding agent that builds software by executing commands and managing files.
 
-main().catch(console.error);
+ENVIRONMENT:
+- All commands run inside a Docker container with Bun installed
+- Working directory is /workspace
+- You have full shell access via execute_command
+- You can read/write files and list directories
+
+APPROACH:
+1. Understand the task requirements fully before starting
+2. Break complex tasks into smaller, testable steps
+3. Create files incrementally, testing as you go
+4. Use execute_command to run tests, install dependencies, etc.
+5. If something fails, read the error and fix it
+
+STYLE:
+- Write clean, idiomatic code
+- Minimal comments (code should be self-documenting)
+- Follow language/framework conventions
+- Test your work before declaring completion
+
+CONSTRAINTS:
+- Do not ask clarifying questions - make reasonable assumptions
+- Focus on implementation, minimize explanation`;
+
+// Agent result type
+export interface AgentResult {
+  success: boolean;
+  finalMessage: string;
+  stepsExecuted: number;
+}
+
+/**
+ * Initialize session with system and user messages.
+ * Persists both to database before starting the agent loop.
+ */
+export async function initializeMessages(
+  sessionId: string,
+  task: string
+): Promise<ModelMessage[]> {
+  // Save system message
+  await saveMessage(
+    sessionId,
+    "system",
+    SYSTEM_PROMPT,
+    estimateTokens(SYSTEM_PROMPT)
+  );
+
+  // Save user message
+  await saveMessage(sessionId, "user", task, estimateTokens(task));
+
+  return [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: task },
+  ];
+}
+
+/**
+ * Serialize message content to a string for storage.
+ * Handles complex content types (tool calls, tool results).
+ */
+export function serializeMessageContent(msg: ModelMessage): string {
+  if (typeof msg.content === "string") {
+    return msg.content;
+  }
+
+  // Handle array content (tool calls, mixed content)
+  if (Array.isArray(msg.content)) {
+    const parts: Array<{ type: string; [key: string]: unknown }> = [];
+
+    for (const part of msg.content) {
+      if ("text" in part && typeof part.text === "string") {
+        parts.push({ type: "text", text: part.text });
+      } else if ("toolName" in part) {
+        parts.push({
+          type: "tool-call",
+          toolCallId: "toolCallId" in part ? part.toolCallId : undefined,
+          toolName: part.toolName,
+          input: "input" in part ? part.input : {},
+        });
+      } else if ("result" in part) {
+        parts.push({
+          type: "tool-result",
+          toolCallId: "toolCallId" in part ? part.toolCallId : undefined,
+          result: part.result,
+        });
+      }
+    }
+
+    return JSON.stringify(parts);
+  }
+
+  // Fallback for any other content type
+  return JSON.stringify(msg.content);
+}
+
+/**
+ * Persist messages from a completed step to the database.
+ * Called by onStepFinish callback after each agent step.
+ */
+export async function persistStepMessages(
+  sessionId: string,
+  newMessages: ModelMessage[]
+): Promise<void> {
+  for (const msg of newMessages) {
+    const content = serializeMessageContent(msg);
+    const tokens = estimateTokens(content);
+    await saveMessage(sessionId, msg.role as "system" | "user" | "assistant" | "tool", content, tokens);
+  }
+}
+
+/**
+ * Main agent loop using Vercel AI SDK's generateText with multi-step support.
+ * Uses prepareStep for context compaction and onStepFinish for persistence.
+ */
+export async function runAgent(
+  sessionId: string,
+  task: string,
+  containerId: string,
+  model: LanguageModel
+): Promise<AgentResult> {
+  // Load or initialize messages
+  let messages = await loadActiveMessages(sessionId);
+  if (messages.length === 0) {
+    messages = await initializeMessages(sessionId, task);
+  }
+
+  console.log(`[Agent] Starting with ${messages.length} messages`);
+
+  // NOTE: System prompt is messages[0], do NOT pass separate 'system' parameter
+  const result = await generateText({
+    model,
+    messages,
+    tools: createTools(containerId),
+    stopWhen: stepCountIs(50),
+
+    prepareStep: async ({ messages: stepMessages }) => {
+      // Check for compaction before each step
+      const tokenCount = estimateMessagesTokens(stepMessages);
+      console.log(`[prepareStep] Token count: ${tokenCount}`);
+
+      if (shouldCompact(stepMessages)) {
+        console.log("[Agent] Triggering compaction...");
+        const compacted = await safeCompact(stepMessages, sessionId, model);
+        return { messages: compacted };
+      }
+
+      return { messages: stepMessages };
+    },
+
+    onStepFinish: async ({ response }) => {
+      // Persist new messages from this step
+      await persistStepMessages(sessionId, response.messages);
+    },
+  });
+
+  const finalText = result.text || "Task completed.";
+  console.log(`[Agent] Completed in ${result.steps.length} steps`);
+
+  return {
+    success: true,
+    finalMessage: finalText,
+    stepsExecuted: result.steps.length,
+  };
+}
+
+/**
+ * Wrapper for runAgent with error handling.
+ * Logs final state on error for debugging.
+ */
+export async function runAgentWithErrorHandling(
+  sessionId: string,
+  task: string,
+  containerId: string,
+  model: LanguageModel
+): Promise<AgentResult> {
+  try {
+    return await runAgent(sessionId, task, containerId, model);
+  } catch (error) {
+    console.error(`[Agent] Error: ${error}`);
+
+    // Log final state for debugging
+    const messages = await getActiveMessages(sessionId);
+    console.error(`[Agent] Final message count: ${messages.length}`);
+
+    throw error;
+  }
+}
+
+// =============================================================================
+// SECTION 9: SESSION LIFECYCLE
+// =============================================================================
+
+/**
+ * Run a complete session: create session, start container, run agent, cleanup.
+ */
+export async function runSession(task: string, model: LanguageModel): Promise<AgentResult> {
+  // 1. Create session
+  const session = await createSession(task);
+  console.log(`[Session] Created: ${session.id}`);
+
+  let containerId: string | null = null;
+
+  try {
+    // 2. Start Docker container
+    containerId = await startContainer(session.id);
+    console.log(`[Session] Container started: ${containerId}`);
+
+    // 3. Run agent loop with compaction
+    const result = await runAgentWithErrorHandling(
+      session.id,
+      task,
+      containerId,
+      model
+    );
+
+    // 4. Update session status to completed
+    await updateSessionStatus(session.id, "completed");
+    console.log(`[Session] Completed successfully`);
+
+    return result;
+  } catch (error) {
+    // Update session status to failed
+    await updateSessionStatus(session.id, "failed");
+    console.error(`[Session] Failed: ${error}`);
+    throw error;
+  } finally {
+    // 5. Always cleanup container
+    if (containerId) {
+      await cleanupContainer(containerId);
+    }
+  }
+}
+
+// =============================================================================
+// SECTION 10: MAIN ENTRY POINT
+// =============================================================================
+
+/**
+ * Read task from stdin and run the agent.
+ */
+async function main() {
+  // Read task from stdin
+  console.log("Enter your task (press Ctrl+D when done):");
+  
+  let task = "";
+  const stdin = Bun.stdin.stream();
+  const reader = stdin.getReader();
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      task += new TextDecoder().decode(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  task = task.trim();
+  if (!task) {
+    console.error("No task provided. Exiting.");
+    process.exit(1);
+  }
+
+  console.log(`\n[Main] Task received: ${task.slice(0, 100)}${task.length > 100 ? "..." : ""}\n`);
+
+  // Configure the model - use Anthropic Claude or OpenAI
+  // Import the provider based on environment
+  let model: LanguageModel;
+
+  if (process.env.ANTHROPIC_API_KEY) {
+    const { anthropic } = await import("@ai-sdk/anthropic");
+    model = anthropic("claude-3-5-sonnet-20241022");
+    console.log("[Main] Using Anthropic Claude 3.5 Sonnet");
+  } else if (process.env.OPENAI_API_KEY) {
+    const { openai } = await import("@ai-sdk/openai");
+    model = openai("gpt-4o");
+    console.log("[Main] Using OpenAI GPT-4o");
+  } else {
+    console.error("Error: No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.");
+    process.exit(1);
+  }
+
+  // Run the session
+  const result = await runSession(task, model);
+
+  console.log("\n========================================");
+  console.log("RESULT");
+  console.log("========================================");
+  console.log(`Success: ${result.success}`);
+  console.log(`Steps executed: ${result.stepsExecuted}`);
+  console.log(`Final message:\n${result.finalMessage}`);
+}
+
+main().catch((error) => {
+  console.error("Fatal error:", error);
+  process.exit(1);
+});
